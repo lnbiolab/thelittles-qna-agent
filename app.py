@@ -291,6 +291,20 @@ elif st.session_state.page == "admin_vector_db":
     
     db_path = f'data/vectors_{selected_brand_en}.db'
     
+    col_sync1, col_sync2 = st.columns([3, 7])
+    with col_sync1:
+        if st.button("🔄 커머스 API 동기화", use_container_width=True):
+            with st.spinner(f"네이버 커머스 API에서 {selected_brand_ko} 데이터를 동기화 중..."):
+                success, inserted, updated = naver_api_agent.process_and_save(selected_brand_en)
+                if success:
+                    st.success(f"동기화 완료! (신규: {inserted}건, 업데이트: {updated}건)")
+                else:
+                    st.error("동기화 중 오류가 발생했습니다. API 인증 정보 및 설정을 확인해주세요.")
+                import time
+                time.sleep(1.5)
+                st.rerun()
+    st.write("")
+    
     if not os.path.exists(db_path):
         st.warning(f"{selected_brand_ko} 브랜드의 지식 DB 파일이 아직 생성되지 않았습니다.")
     else:
@@ -698,7 +712,7 @@ elif st.session_state.page.startswith("qa_"):
                         
                         del st.session_state[current_temp_ans_key]
                         del st.session_state[current_temp_src_key]
-                        st.session_state[selected_qa_key] = "NEW_DRAFT"
+                        st.session_state[selected_qa_key] = new_cid
                         st.success("새 Q&A 내역이 목록에 저장되었습니다.")
                         import time
                         time.sleep(1)
@@ -715,8 +729,10 @@ elif st.session_state.page.startswith("qa_"):
                             db.add_message(current_cid, "assistant", edited_ans, temp_src)
                             
                         db.rename_chat(current_cid, edited_q[:30] + ("..." if len(edited_q) > 30 else ""))
-                        st.session_state[current_temp_ans_key] = edited_ans
-                        st.session_state[selected_qa_key] = "NEW_DRAFT"
+                        if current_temp_ans_key in st.session_state:
+                            del st.session_state[current_temp_ans_key]
+                        if current_temp_src_key in st.session_state:
+                            del st.session_state[current_temp_src_key]
                         st.success("질문과 답변 내역이 임시 저장되었습니다.")
                         import time
                         time.sleep(1)
@@ -737,7 +753,7 @@ elif st.session_state.page.startswith("qa_"):
                         
                         del st.session_state[current_temp_ans_key]
                         del st.session_state[current_temp_src_key]
-                        st.session_state[selected_qa_key] = "NEW_DRAFT"
+                        st.session_state[selected_qa_key] = new_cid
                     else:
                         if q_msg:
                             db.update_message(q_msg["id"], edited_q, [], image_path=img_path_for_db)
@@ -750,7 +766,10 @@ elif st.session_state.page.startswith("qa_"):
                             db.add_message(current_cid, "assistant", edited_ans, temp_src)
                             
                         db.rename_chat(current_cid, edited_q[:30] + ("..." if len(edited_q) > 30 else ""))
-                        st.session_state[selected_qa_key] = "NEW_DRAFT"
+                        if current_temp_ans_key in st.session_state:
+                            del st.session_state[current_temp_ans_key]
+                        if current_temp_src_key in st.session_state:
+                            del st.session_state[current_temp_src_key]
                     
                     st.success("답변이 저장되고 지식 DB에 반영되었습니다.")
                     import time

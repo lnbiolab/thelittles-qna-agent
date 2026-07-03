@@ -253,59 +253,64 @@ def init_vector_db(db_path, embedding_dim):
     return conn
 
 def process_and_save(brand="thelittles"):
-    inquiries = fetch_inquiries(brand)
-    if not inquiries:
-        print("⚠️ 처리할 데이터가 없습니다. 프로세스를 종료합니다.")
-        return
+    try:
+        inquiries = fetch_inquiries(brand)
+        if not inquiries:
+            print("⚠️ 처리할 데이터가 없습니다. 프로세스를 종료합니다.")
+            return True, 0, 0
 
-    model = load_embedding_model()
-    dim = model.get_sentence_embedding_dimension()
-    
-    db_path = get_db_path(brand)
-    conn = init_vector_db(str(db_path), dim)
-    cursor = conn.cursor()
-    
-    print("🔄 청크 생성 및 임베딩 진행 중...")
-    inserted_count = 0
-    updated_count = 0
-    
-    for item in inquiries:
-        q_id = str(item.get('questionId', item.get('inquiryNo', '')))
-        p_name = item.get('productName', '상품명 없음')
-        title = item.get('title', item.get('questionTitle', ''))
-        content = item.get('content', item.get('questionContent', item.get('question', '')))
+        model = load_embedding_model()
+        dim = model.get_sentence_embedding_dimension()
         
-        is_answered = item.get('isAnswered', item.get('answered', False))
-        answer = item.get('answerContent', item.get('answer', '')) if is_answered else '답변 대기중'
+        db_path = get_db_path(brand)
+        conn = init_vector_db(str(db_path), dim)
+        cursor = conn.cursor()
         
-        chunk_text = f"[상품명] {p_name}\n[제목] {title}\n[질문] {content}\n[답변] {answer}"
+        print("🔄 청크 생성 및 임베딩 진행 중...")
+        inserted_count = 0
+        updated_count = 0
         
-        emb = model.encode(chunk_text, normalize_embeddings=True).tolist()
-        emb_bytes = embedding_to_bytes(emb)
-        
-        cursor.execute("SELECT id FROM chunks WHERE inquiry_id = ?", (q_id,))
-        existing = cursor.fetchone()
-        
-        if existing:
-            cursor.execute('''
-                UPDATE chunks 
-                SET chunk_text=?, product_name=?, subject=?, is_answered=?, embedding=?
-                WHERE id=?
-            ''', (chunk_text, p_name, title, 1 if is_answered else 0, emb_bytes, existing[0]))
-            updated_count += 1
-        else:
-            cursor.execute('''
-                INSERT INTO chunks (inquiry_id, chunk_text, product_name, subject, is_answered, embedding)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (q_id, chunk_text, p_name, title, 1 if is_answered else 0, emb_bytes))
-            inserted_count += 1
+        for item in inquiries:
+            q_id = str(item.get('questionId', item.get('inquiryNo', '')))
+            p_name = item.get('productName', '상품명 없음')
+            title = item.get('title', item.get('questionTitle', ''))
+            content = item.get('content', item.get('questionContent', item.get('question', '')))
             
-    conn.commit()
-    conn.close()
-    
-    print(f"\n🎉 작업 완료! 새로운 DB 생성/업데이트 완료")
-    print(f"📁 DB 저장 위치: {db_path}")
-    print(f"📊 신규 저장: {inserted_count}건 | 업데이트: {updated_count}건")
+            is_answered = item.get('isAnswered', item.get('answered', False))
+            answer = item.get('answerContent', item.get('answer', '')) if is_answered else '답변 대기중'
+            
+            chunk_text = f"[상품명] {p_name}\n[제목] {title}\n[질문] {content}\n[답변] {answer}"
+            
+            emb = model.encode(chunk_text, normalize_embeddings=True).tolist()
+            emb_bytes = embedding_to_bytes(emb)
+            
+            cursor.execute("SELECT id FROM chunks WHERE inquiry_id = ?", (q_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                cursor.execute('''
+                    UPDATE chunks 
+                    SET chunk_text=?, product_name=?, subject=?, is_answered=?, embedding=?
+                    WHERE id=?
+                ''', (chunk_text, p_name, title, 1 if is_answered else 0, emb_bytes, existing[0]))
+                updated_count += 1
+            else:
+                cursor.execute('''
+                    INSERT INTO chunks (inquiry_id, chunk_text, product_name, subject, is_answered, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (q_id, chunk_text, p_name, title, 1 if is_answered else 0, emb_bytes))
+                inserted_count += 1
+                
+        conn.commit()
+        conn.close()
+        
+        print(f"\n🎉 작업 완료! 새로운 DB 생성/업데이트 완료")
+        print(f"📁 DB 저장 위치: {db_path}")
+        print(f"📊 신규 저장: {inserted_count}건 | 업데이트: {updated_count}건")
+        return True, inserted_count, updated_count
+    except Exception as e:
+        print(f"❌ 동기화 중 에러 발생: {e}")
+        return False, 0, 0
 
 def update_inquiry_to_db(brand, q_id, p_name, title, content, answer, embedding_model=None):
     db_path = get_db_path(brand)
