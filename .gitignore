@@ -11,3 +11,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+
+# Never commit raw customer SQL exports. Schema-only documentation is allowed.
+docs/*counseling*.sql
+docs/*counseling*.sql.*
+!docs/*structure*.sql

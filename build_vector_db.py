@@ -8,6 +8,7 @@ littlelabs-qna-agent: SQL 데이터를 chunking + embedding하여 SQLite 벡터 
 4. SQLite DB에 원본 데이터 + 벡터 저장
 """
 
+import argparse
 import sqlite3
 import re
 import json
@@ -682,11 +683,25 @@ def hybrid_search(db_path: str, model, query: str, top_k: int = 5,
 # ============================================================
 
 def main():
-    base_dir = Path(__file__).parent
-    sql_file = base_dir / 'docs' / 'g5_write_counseling2.sql'
-    db_path = base_dir / 'data' / 'counseling_vectors.db'
-    
-    # data 디렉토리 생성
+    parser = argparse.ArgumentParser(
+        description="Build a LittleLabs vector database from an approved SQL export."
+    )
+    parser.add_argument(
+        "--input-sql", required=True, type=Path,
+        help="Path to the SQL export. Keep production exports outside this Git repository.",
+    )
+    parser.add_argument(
+        "--output-db", type=Path, default=Path("data/counseling_vectors.db"),
+        help="Output SQLite path (default: data/counseling_vectors.db).",
+    )
+    args = parser.parse_args()
+    sql_file = args.input_sql.expanduser().resolve()
+    db_path = args.output_db.expanduser().resolve()
+    if not sql_file.is_file():
+        parser.error(f"Input SQL file does not exist: {sql_file}")
+    if sql_file.stat().st_size == 0:
+        parser.error(f"Input SQL file is empty: {sql_file}")
+    # Output data stays outside Git; create only its requested parent directory.
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
