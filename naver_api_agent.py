@@ -252,9 +252,56 @@ def init_vector_db(db_path, embedding_dim):
     conn.commit()
     return conn
 
-def process_and_save(brand="thelittles"):
+def get_existing_inquiry_ids(db_path):
+    """Return the set of inquiry_ids already stored in the vector DB."""
+    if not os.path.exists(db_path):
+        return set()
+    conn = sqlite3.connect(db_path)
     try:
-        inquiries = fetch_inquiries(brand)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT inquiry_id FROM chunks WHERE inquiry_id IS NOT NULL AND inquiry_id != ''")
+        return {str(row[0]) for row in cursor.fetchall()}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+
+
+def fetch_recent_inquiries(brand, days=30):
+    """Fetch only the last N days of inquiries for incremental sync."""
+    access_token = get_access_token(brand)
+    if not access_token:
+        return []
+    headers = {'Authorization': f"Bearer {access_token}", 'content-type': 'application/json'}
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    from_date_str = (now - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S+09:00')
+    to_date_str = now.strftime('%Y-%m-%dT%H:%M:%S+09:00')
+    all_items = []
+    page = 1
+    while True:
+        params = {'fromDate': from_date_str, 'toDate': to_date_str, 'page': page, 'size': 100}
+        url = f"{API_HOST}/external/v1/contents/qnas"
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            break
+        data = response.json()
+        contents = data.get('contents', [])
+        all_items.extend(contents)
+        if data.get('last') or len(contents) < 100:
+            break
+        page += 1
+    return all_items
+
+
+def process_and_save(brand="thelittles", days=30, incremental=True):
+    try:
+        db_path = get_db_path(brand)
+        existing_ids = set() if not incremental else get_existing_inquiry_ids(db_path)
+        if incremental:
+            inquiries = fetch_recent_inquiries(brand, days=days)
+        else:
+            inquiries = fetch_inquiries(brand)
         if not inquiries:
             print("⚠️ 처리할 데이터가 없습니다. 프로세스를 종료합니다.")
             return True, 0, 0
@@ -269,6 +316,7 @@ def process_and_save(brand="thelittles"):
         print("🔄 청크 생성 및 임베딩 진행 중...")
         inserted_count = 0
         updated_count = 0
+        skipped_count = 0
         
         for item in inquiries:
             q_id = str(item.get('questionId', item.get('inquiryNo', '')))
@@ -279,6 +327,10 @@ def process_and_save(brand="thelittles"):
             is_answered = item.get('isAnswered', item.get('answered', False))
             answer = item.get('answerContent', item.get('answer', '')) if is_answered else '답변 대기중'
             
+            if incremental and q_id in existing_ids and item.get('isAnswered', item.get('answered', False)):
+                # Already stored and answered; nothing to refresh.
+                skipped_count += 1
+                continue
             chunk_text = f"[상품명] {p_name}\n[제목] {title}\n[질문] {content}\n[답변] {answer}"
             
             emb = model.encode(chunk_text, normalize_embeddings=True).tolist()
@@ -306,7 +358,7 @@ def process_and_save(brand="thelittles"):
         
         print(f"\n🎉 작업 완료! 새로운 DB 생성/업데이트 완료")
         print(f"📁 DB 저장 위치: {db_path}")
-        print(f"📊 신규 저장: {inserted_count}건 | 업데이트: {updated_count}건")
+        print(f"📊 신규 저장: {inserted_count}건 | 업데이트: {updated_count}건 | 건너뜀: {skipped_count}건")
         return True, inserted_count, updated_count
     except Exception as e:
         print(f"❌ 동기화 중 에러 발생: {e}")
