@@ -406,5 +406,122 @@ def ingest_excel_qa(brand, file_path_or_bytes, embedding_model=None):
     finally:
         conn.close()
 
+def _get_sheet_service():
+    """Google Sheets API 클라이언트 (서비스 계정)."""
+    import json
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    creds_info = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not creds_info:
+        # .env 파일 폴백 로드
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if os.path.exists(env_path):
+            with open(env_path) as ef:
+                for line in ef:
+                    if line.startswith("GOOGLE_SERVICE_ACCOUNT_JSON="):
+                        creds_info = line.split("=", 1)[1].strip().strip('"')
+                        break
+    if not creds_info:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON이 설정되지 않았습니다.")
+
+    creds = Credentials.from_service_account_info(
+        json.loads(creds_info),
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    return build("sheets", "v4", credentials=creds)
+
+
+def get_sheet_id(brand):
+    """브랜드별 구글 시트 ID 반환 (환경변수 GOOGLE_SHEET_ID_<BRAND>)."""
+    return os.environ.get(f"GOOGLE_SHEET_ID_{brand.upper()}")
+
+
+def sync_google_sheet_qa(brand, sheet_id=None, embedding_model=None):
+    """브랜드 구글 시트 → 지식 DB 동기화.
+
+    시트 형식: 3행부터, B열=질문, C열=모범답변 (엑셀 가이드와 동일 규칙)
+    - 각 행을 시트 행 번호 기반 소스 ID(gsheet_<brand>_R<row>)로 저장
+    - 시트에서 수정된 행은 청크 갱신, 삭제된 행은 청크 제거
+    Returns: (success, message)
+    """
+    if sheet_id is None:
+        sheet_id = get_sheet_id(brand)
+    if not sheet_id:
+        return False, f"{brand} 브랜드의 구글 시트 ID가 설정되지 않았습니다. (GOOGLE_SHEET_ID_{brand.upper()})"
+
+    if embedding_model is None:
+        embedding_model = load_embedding_model()
+
+    db_path = get_db_path(brand)
+    init_vector_db(str(db_path), embedding_model.get_sentence_embedding_dimension())
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        service = _get_sheet_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range="A1:Z2000"
+        ).execute()
+        rows = result.get("values", [])
+
+        # 시트에서 유효한 행 수집
+        sheet_items = {}  # row_number -> (question, answer)
+        for i, row in enumerate(rows, start=1):
+            if i <= 2 or len(row) < 3:
+                continue
+            question = str(row[1]).strip() if len(row) > 1 else ""
+            answer = str(row[2]).strip() if len(row) > 2 else ""
+            if question and answer:
+                sheet_items[i] = (question, answer)
+
+        prefix = f"gsheet_{brand}_R"
+        # 기존 시트 소스 청크 ID 목록
+        cursor.execute("SELECT inquiry_id, id FROM chunks WHERE inquiry_id LIKE ?", (prefix + "%",))
+        existing = {r[0]: r[1] for r in cursor.fetchall()}
+
+        inserted = updated = 0
+        current_ids = set()
+        for row_no, (question, answer) in sheet_items.items():
+            q_id = f"{prefix}{row_no}"
+            current_ids.add(q_id)
+            chunk_text = f"[구글시트 가이드라인: {brand}]\n[고객문의/상황] {question}\n[모범답변] {answer}"
+            emb = embedding_model.encode(chunk_text, normalize_embeddings=True).tolist()
+            emb_bytes = embedding_to_bytes(emb)
+            subject = f"[시트 {row_no}행] {question}"
+            if len(subject) > 80:
+                subject = subject[:77] + "..."
+
+            if q_id in existing:
+                cursor.execute('''
+                    UPDATE chunks SET chunk_text=?, subject=?, embedding=? WHERE id=?
+                ''', (chunk_text, subject, emb_bytes, existing[q_id]))
+                updated += 1
+            else:
+                cursor.execute('''
+                    INSERT INTO chunks (inquiry_id, chunk_text, product_name, subject, is_answered, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (q_id, chunk_text, '가이드라인', subject, 1, emb_bytes))
+                inserted += 1
+
+        # 시트에서 삭제된 행 제거
+        removed = 0
+        for q_id, cid in existing.items():
+            if q_id not in current_ids:
+                cursor.execute("DELETE FROM chunks WHERE id=?", (cid,))
+                removed += 1
+
+        conn.commit()
+        return True, (
+            f"구글 시트 동기화 완료 — 신규 {inserted}건, 갱신 {updated}건, "
+            f"삭제 {removed}건 (시트 유효 행: {len(sheet_items)}건)"
+        )
+    except Exception as e:
+        conn.rollback()
+        return False, f"구글 시트 동기화 중 오류 발생: {str(e)}"
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     process_and_save("thelittles")
