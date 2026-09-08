@@ -440,9 +440,17 @@ def get_sheet_id(brand):
 def sync_google_sheet_qa(brand, sheet_id=None, embedding_model=None):
     """브랜드 구글 시트 → 지식 DB 동기화.
 
-    시트 형식: 3행부터, B열=질문, C열=모범답변 (엑셀 가이드와 동일 규칙)
-    - 각 행을 시트 행 번호 기반 소스 ID(gsheet_<brand>_R<row>)로 저장
-    - 시트에서 수정된 행은 청크 갱신, 삭제된 행은 청크 제거
+    원본 Q&A 엑셀 양식(제품 Q&A 그린루트/엘앤/퓨어젠 구글시트)을 그대로 읽는다.
+    각 탭의 실제 구조에 맞춰 파싱한다:
+    - 제품 탭(오메가3 등): 1행=제품명(단일 셀), 2행=헤더(구분/질문/답변), 3행부터 B열=질문 C열=답변
+      (예외: 피부오메가7은 1행부터 헤더)
+    - 확인요청&제안 탭: 4행이 헤더(기존 답변.../대체 답변), 5행부터 B열=기존답변(질문 맥락) C열=대체 답변(지침)
+      → "지침: C열" 형태의 상담 가이드 청크로 저장
+    - 주문&배송 탭: A열 단일 열, 주제행(1단어) 다음 답변행이 반복되는 구조 → 주제+본문 결합
+    - 종합문의(엘앤/퓨어젠): 1행=타이틀, 2행부터 A열=주제/질문, B열=답변
+    - 종합문의(그린루트): 1행=타이틀, 2행부터 A열=질문, B열=답변 (중간 빈행 이후 재개 포함)
+
+    - 각 청크는 gsheet_<brand>_<탭명해시>_<행번호> 소스 ID로 저장 → 수정 시 갱신, 삭제 시 제거
     Returns: (success, message)
     """
     if sheet_id is None:
@@ -458,64 +466,115 @@ def sync_google_sheet_qa(brand, sheet_id=None, embedding_model=None):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    import hashlib
+
+    def cell(row, idx):
+        return str(row[idx]).strip() if len(row) > idx and str(row[idx]).strip() else ""
+
+    def parse_tab(title, rows):
+        """하나의 탭을 [(row_no, chunk_type, question, answer)]로 파싱."""
+        out = []
+        if not rows:
+            return out
+        if title.startswith("확인요청&제안"):
+            # 4행 헤더, 5행부터 B=기존답변/질문맥락, C=대체 답변(상담 지침)
+            for i, row in enumerate(rows, 1):
+                if i <= 4:
+                    continue
+                q, a = cell(row, 1), cell(row, 2)
+                if q or a:
+                    out.append((i, "상담지침", q or "(질문 원문 없음)", a))
+        elif title == "주문&배송":
+            # A열 단일 열: 주제 행 다음 답변 행
+            pending = None
+            for i, row in enumerate(rows, 1):
+                v = cell(row, 0)
+                if not v:
+                    continue
+                if pending is None:
+                    pending = (i, v)
+                else:
+                    out.append((i, "주문배송", pending[1], v))
+                    pending = None
+        elif title == "종합문의" and brand == "greenroot":
+            # 1행 타이틀, 2행부터 A=질문 B=답변
+            for i, row in enumerate(rows, 1):
+                if i <= 1:
+                    continue
+                q, a = cell(row, 0), cell(row, 1)
+                if q and a:
+                    out.append((i, "종합문의", q, a))
+        else:
+            # 제품 탭 + 엘앤/퓨어젠 종합문의
+            # 헤더 감지: '질문'이 B열에 있는 행을 찾아 그 다음 행부터 데이터
+            # (피부오메가7처럼 1행이 헤더인 경우도 자동 처리)
+            start = 1
+            for i, row in enumerate(rows, 1):
+                if cell(row, 1) == "질문":
+                    start = i + 1
+                    break
+            else:
+                # 헤더 없으면 1행이 단일 타이틀(제품명)인지 확인
+                if len(rows[0]) >= 2 and cell(rows[0], 1):
+                    start = 1
+                else:
+                    start = 2
+            for i, row in enumerate(rows, 1):
+                if i < start:
+                    continue
+                q, a = cell(row, 1), cell(row, 2)
+                if q and a and q != "질문":
+                    out.append((i, "제품QA", q, a))
+        return out
+
     try:
         service = _get_sheet_service()
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range="A1:Z2000"
-        ).execute()
-        rows = result.get("values", [])
+        meta = service.spreadsheets().get(
+            spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
+        titles = [s["properties"]["title"] for s in meta["sheets"]]
+        result = service.spreadsheets().values().batchGet(
+            spreadsheetId=sheet_id,
+            ranges=[f"'{t}'!A1:Z2000" for t in titles]).execute()
 
-        # 시트에서 유효한 행 수집
-        sheet_items = {}  # row_number -> (question, answer)
-        for i, row in enumerate(rows, start=1):
-            if i <= 2 or len(row) < 3:
-                continue
-            question = str(row[1]).strip() if len(row) > 1 else ""
-            answer = str(row[2]).strip() if len(row) > 2 else ""
-            if question and answer:
-                sheet_items[i] = (question, answer)
+        sheet_items = {}  # row_no -> (chunk_text, product_name, subject)
+        for title, vr in zip(titles, result.get("valueRanges", [])):
+            rows = vr.get("values", [])
+            for row_no, ctype, question, answer in parse_tab(title, rows):
+                q_id = f"gsheet_{brand}_{hashlib.md5(title.encode()).hexdigest()[:6]}_{row_no}"
+                chunk_text = (f"[구글시트 가이드라인: {brand} / {title} / {ctype}]\n"
+                              f"[고객문의/상황] {question}\n[모범답변/지침] {answer}")
+                subject = f"[{title}] {question}"
+                if len(subject) > 80:
+                    subject = subject[:77] + "..."
+                sheet_items[q_id] = (chunk_text, "가이드라인", subject)
 
-        prefix = f"gsheet_{brand}_R"
-        # 기존 시트 소스 청크 ID 목록
+        prefix = f"gsheet_{brand}_"
         cursor.execute("SELECT inquiry_id, id FROM chunks WHERE inquiry_id LIKE ?", (prefix + "%",))
         existing = {r[0]: r[1] for r in cursor.fetchall()}
 
         inserted = updated = 0
-        current_ids = set()
-        for row_no, (question, answer) in sheet_items.items():
-            q_id = f"{prefix}{row_no}"
-            current_ids.add(q_id)
-            chunk_text = f"[구글시트 가이드라인: {brand}]\n[고객문의/상황] {question}\n[모범답변] {answer}"
+        for q_id, (chunk_text, pname, subject) in sheet_items.items():
             emb = embedding_model.encode(chunk_text, normalize_embeddings=True).tolist()
             emb_bytes = embedding_to_bytes(emb)
-            subject = f"[시트 {row_no}행] {question}"
-            if len(subject) > 80:
-                subject = subject[:77] + "..."
-
             if q_id in existing:
-                cursor.execute('''
-                    UPDATE chunks SET chunk_text=?, subject=?, embedding=? WHERE id=?
-                ''', (chunk_text, subject, emb_bytes, existing[q_id]))
+                cursor.execute("UPDATE chunks SET chunk_text=?, product_name=?, subject=?, embedding=? WHERE id=?",
+                               (chunk_text, pname, subject, emb_bytes, existing[q_id]))
                 updated += 1
             else:
-                cursor.execute('''
-                    INSERT INTO chunks (inquiry_id, chunk_text, product_name, subject, is_answered, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (q_id, chunk_text, '가이드라인', subject, 1, emb_bytes))
+                cursor.execute("""INSERT INTO chunks (inquiry_id, chunk_text, product_name, subject, is_answered, embedding)
+                                  VALUES (?, ?, ?, ?, 1, ?)""",
+                               (q_id, chunk_text, pname, subject, emb_bytes))
                 inserted += 1
 
-        # 시트에서 삭제된 행 제거
         removed = 0
         for q_id, cid in existing.items():
-            if q_id not in current_ids:
+            if q_id not in sheet_items:
                 cursor.execute("DELETE FROM chunks WHERE id=?", (cid,))
                 removed += 1
 
         conn.commit()
-        return True, (
-            f"구글 시트 동기화 완료 — 신규 {inserted}건, 갱신 {updated}건, "
-            f"삭제 {removed}건 (시트 유효 행: {len(sheet_items)}건)"
-        )
+        return True, (f"구글 시트 동기화 완료 — 신규 {inserted}건, 갱신 {updated}건, "
+                      f"삭제 {removed}건 (총 청크: {len(sheet_items)}건, 탭 {len(titles)}개)")
     except Exception as e:
         conn.rollback()
         return False, f"구글 시트 동기화 중 오류 발생: {str(e)}"
