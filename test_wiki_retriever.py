@@ -37,7 +37,7 @@ status: reviewed
 tags: [process]
 ---
 ### Q: 내부 절차는?
-A: 고객에게 공개하면 안 됩니다.
+A: 이 내용은 고객 답변으로 내보내면 안 됩니다.
 """,
     )
     write_page(
@@ -60,49 +60,68 @@ A: 다른 브랜드 답변입니다.
     assert hits[0]["question"] == "아이 키 영양제는 언제 먹나요?"
 
 
-def test_matches_korean_substring_terms_and_ranks_best_hit_first(tmp_path):
+def test_returns_selected_icloud_raw_sections_without_database(tmp_path):
     wiki = tmp_path / "wiki"
     write_page(
-        wiki / "concepts" / "growth.md",
+        wiki / "raw" / "icloud" / "growth.md",
         """---
-brand: littlelabs
-qna_export: true
-status: approved
-tags: [nutrition, intake]
+source_title: 키영양제
+customer_search: true
+qna_export: false
 ---
-### Q: 키 영양제는 어떻게 먹나요?
-A: 성장기 영양 관리는 제품 라벨을 확인하세요.
-""",
-    )
-    write_page(
-        wiki / "concepts" / "digestion.md",
-        """---
-brand: littlelabs
-qna_export: true
-status: approved
-tags: [nutrition]
+# 키영양제
+
 ---
-### Q: 소화가 불편해요.
-A: 개인 상태에 따라 전문가 상담이 필요할 수 있습니다.
+
+<복용 방법>
+알약을 못 먹으면 수저 뒤로 부셔서 섭취할 수 있습니다.
+
+---
+
+<주의사항>
+제품 라벨과 전문가 안내를 확인하세요.
 """,
     )
 
-    hits = module.search_customer_qna(wiki, "littlelabs", "키 영양제 어떻게 먹나요", top_k=3)
+    hits = module.search_customer_qna(wiki, "littlelabs", "키 영양제 알약 복용", top_k=3)
 
-    assert [hit["source"] for hit in hits] == ["concepts/growth.md"]
+    assert len(hits) == 1
+    assert hits[0]["source"] == "raw/icloud/growth.md"
+    assert "알약을 못 먹으면" in hits[0]["chunk_text"]
+    assert hits[0]["type"] == "wiki-raw"
 
 
-def test_returns_no_result_when_no_approved_customer_qa_matches(tmp_path):
+def test_excludes_unselected_or_non_icloud_raw_sources(tmp_path):
     wiki = tmp_path / "wiki"
     write_page(
-        wiki / "raw" / "icloud" / "raw-note.md",
+        wiki / "raw" / "icloud" / "unselected.md",
         """---
-brand: littlelabs
-qna_export: true
+source_title: 내부 메모
+customer_search: false
 ---
-### Q: 키 영양제는?
-A: raw는 검색 대상이 아닙니다.
+키 영양제 내부 내용
+""",
+    )
+    write_page(
+        wiki / "raw" / "openviking" / "internal.md",
+        """---
+customer_search: true
+---
+키 영양제처럼 보이는 내부 운영 내용
 """,
     )
 
     assert module.search_customer_qna(wiki, "littlelabs", "키 영양제", top_k=3) == []
+
+
+if __name__ == "__main__":
+    from tempfile import TemporaryDirectory
+
+    for test in [
+        test_returns_only_explicitly_approved_pages_for_matching_brand,
+        test_returns_selected_icloud_raw_sections_without_database,
+        test_excludes_unselected_or_non_icloud_raw_sources,
+    ]:
+        with TemporaryDirectory() as directory:
+            test(Path(directory))
+    print("3 tests passed")

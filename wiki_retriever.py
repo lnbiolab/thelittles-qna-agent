@@ -25,25 +25,36 @@ def _tokens(text: str) -> set[str]:
     return {token.lower() for token in TOKEN_RE.findall(text)}
 
 
-def _approved_customer_page(path: Path, brand: str) -> str | None:
-    if "raw" in path.parts:
-        return None
+def _frontmatter_and_body(path: Path) -> tuple[str, str] | None:
     text = path.read_text(encoding="utf-8")
     match = FRONTMATTER_RE.match(text)
     if not match:
         return None
-    frontmatter = match.group(1)
+    return match.group(1), text[match.end():]
+
+
+def _approved_customer_page(path: Path, brand: str) -> str | None:
+    if "raw" in path.parts:
+        return None
+    parsed = _frontmatter_and_body(path)
+    if parsed is None:
+        return None
+    frontmatter, body = parsed
     if _frontmatter_value(frontmatter, "qna_export").lower() != "true":
         return None
     if _frontmatter_value(frontmatter, "brand").lower() != brand.lower():
         return None
     if _frontmatter_value(frontmatter, "status").lower() != "approved":
         return None
-    return text[match.end():]
+    return body
+
+
+def _split_raw_sections(body: str) -> list[str]:
+    return [section.strip() for section in re.split(r"^\s*-{3,}\s*$", body, flags=re.MULTILINE) if section.strip()]
 
 
 def search_customer_qna(wiki_path: Path, brand: str, query: str, top_k: int = 3) -> list[dict[str, str]]:
-    """Return approved Q&A matches, ranked by exact Korean/English token overlap."""
+    """Search approved Q&A, then explicitly selected iCloud source sections, without a DB."""
     if top_k < 1 or not wiki_path.exists():
         return []
     query_tokens = _tokens(query)
@@ -54,22 +65,38 @@ def search_customer_qna(wiki_path: Path, brand: str, query: str, top_k: int = 3)
     for page in sorted(wiki_path.glob("**/*.md")):
         if page.name in {"SCHEMA.md", "index.md", "log.md"}:
             continue
+        source = str(page.relative_to(wiki_path))
         body = _approved_customer_page(page, brand)
-        if body is None:
+        if body is not None:
+            for match in QA_RE.finditer(body):
+                question = " ".join(match.group(1).split())
+                answer = "\n".join(line.strip() for line in match.group(2).strip().splitlines())
+                overlap = len(query_tokens & _tokens(question + "\n" + answer))
+                if overlap:
+                    ranked.append((overlap, source, {
+                        "source": source, "question": question, "answer": answer,
+                        "subject": question, "type": "wiki",
+                        "chunk_text": f"[Wiki 고객 Q&A]\nQ: {question}\nA: {answer}",
+                    }))
             continue
-        for match in QA_RE.finditer(body):
-            question = " ".join(match.group(1).split())
-            answer = "\n".join(line.strip() for line in match.group(2).strip().splitlines())
-            terms = _tokens(question + "\n" + answer)
-            overlap = len(query_tokens & terms)
+
+        if "raw" not in page.parts or "icloud" not in page.parts:
+            continue
+        parsed = _frontmatter_and_body(page)
+        if parsed is None:
+            continue
+        frontmatter, raw_body = parsed
+        if _frontmatter_value(frontmatter, "customer_search").lower() != "true":
+            continue
+        title = _frontmatter_value(frontmatter, "source_title") or page.stem
+        for section in _split_raw_sections(raw_body):
+            overlap = len(query_tokens & _tokens(title + "\n" + section))
             if overlap:
-                source = str(page.relative_to(wiki_path))
                 ranked.append((overlap, source, {
-                    "source": source,
-                    "question": question,
-                    "answer": answer,
-                    "subject": question,
-                    "chunk_text": f"[Wiki 고객 Q&A]\nQ: {question}\nA: {answer}",
+                    "source": source, "question": title, "answer": section,
+                    "subject": title, "type": "wiki-raw",
+                    "chunk_text": f"[Wiki iCloud 원문]\n제목: {title}\n내용:\n{section}",
                 }))
-    ranked.sort(key=lambda item: (-item[0], item[1], item[2]["question"]))
+
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]["chunk_text"]))
     return [item[2] for item in ranked[:top_k]]
