@@ -89,6 +89,24 @@ qna_export: false
     assert hits[0]["source"] == "raw/icloud/growth.md"
     assert "알약을 못 먹으면" in hits[0]["chunk_text"]
     assert hits[0]["type"] == "wiki-raw"
+    assert len(hits[0]["chunk_text"]) <= 1900
+
+
+def test_splits_large_selected_icloud_sections_into_bounded_search_contexts(tmp_path):
+    wiki = tmp_path / "wiki"
+    write_page(
+        wiki / "raw" / "icloud" / "large.md",
+        """---
+source_title: 키영양제
+customer_search: true
+---
+""" + "키 영양제 알약 복용 방법입니다.\n\n" * 300,
+    )
+
+    hits = module.search_customer_qna(wiki, "littlelabs", "키 영양제 알약 복용", top_k=3)
+
+    assert hits
+    assert all(len(hit["chunk_text"]) <= 1900 for hit in hits)
 
 
 def test_excludes_unselected_or_non_icloud_raw_sources(tmp_path):
@@ -120,6 +138,7 @@ if __name__ == "__main__":
     for test in [
         test_returns_only_explicitly_approved_pages_for_matching_brand,
         test_returns_selected_icloud_raw_sections_without_database,
+        test_splits_large_selected_icloud_sections_into_bounded_search_contexts,
         test_excludes_unselected_or_non_icloud_raw_sources,
     ]:
         with TemporaryDirectory() as directory:

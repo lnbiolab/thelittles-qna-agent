@@ -49,8 +49,34 @@ def _approved_customer_page(path: Path, brand: str) -> str | None:
     return body
 
 
+MAX_CONTEXT_CHARS = 1800
+
+
 def _split_raw_sections(body: str) -> list[str]:
-    return [section.strip() for section in re.split(r"^\s*-{3,}\s*$", body, flags=re.MULTILINE) if section.strip()]
+    sections = [section.strip() for section in re.split(r"^\s*-{3,}\s*$", body, flags=re.MULTILINE) if section.strip()]
+    chunks: list[str] = []
+    for section in sections:
+        if len(section) <= MAX_CONTEXT_CHARS:
+            chunks.append(section)
+            continue
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", section) if part.strip()]
+        current = ""
+        for paragraph in paragraphs:
+            if len(paragraph) > MAX_CONTEXT_CHARS:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.extend(paragraph[i:i + MAX_CONTEXT_CHARS] for i in range(0, len(paragraph), MAX_CONTEXT_CHARS))
+            elif not current:
+                current = paragraph
+            elif len(current) + 2 + len(paragraph) <= MAX_CONTEXT_CHARS:
+                current += "\n\n" + paragraph
+            else:
+                chunks.append(current)
+                current = paragraph
+        if current:
+            chunks.append(current)
+    return chunks
 
 
 def search_customer_qna(wiki_path: Path, brand: str, query: str, top_k: int = 3) -> list[dict[str, str]]:
