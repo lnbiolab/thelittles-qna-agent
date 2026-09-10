@@ -1,7 +1,12 @@
 import os
 import sys
 import time
+from pathlib import Path
 from retriever import Retriever
+from wiki_retriever import search_customer_qna
+
+def get_customer_qna_wiki_path() -> Path:
+    return Path(os.environ.get("CUSTOMER_QNA_WIKI_PATH", "/app/data/wiki"))
 
 # Huggingface Hub / Streamlit Threading 버그(httpx client closed) 우회 및 오프라인 로드 강제
 os.environ["HF_HUB_DISABLE_HTTP2"] = "1"
@@ -134,15 +139,27 @@ class QnAAgent:
                 search_query = f"{query} {ocr_text[:300]}"
                 
         print(f"Searching for relevant past Q&A for: '{query}' (Search Query: '{search_query[:100]}...') ({chat_type})...")
-        retriever = self.get_retriever(chat_type)
-        contexts = retriever.hybrid_search(search_query, top_k=top_k)
-        
+        brand = chat_type.replace("cs_", "").replace("qa_", "").replace("excel_", "")
+        if brand == "store":
+            brand = "thelittles"
+        if brand == "health":
+            brand = "littlelabs"
+
+        wiki_contexts = search_customer_qna(get_customer_qna_wiki_path(), brand, search_query, top_k=top_k)
+        if wiki_contexts:
+            contexts = wiki_contexts
+            source_type = "wiki"
+        else:
+            retriever = self.get_retriever(chat_type)
+            contexts = retriever.hybrid_search(search_query, top_k=top_k)
+            source_type = None
+
         if not contexts:
             return {
                 "answer": "관련된 과거 내역을 찾을 수 없습니다. 좀 더 구체적으로 질문해주세요.",
                 "sources": []
             }
-            
+
         prompt = self._build_prompt(query, contexts, chat_type)
         if ocr_text:
             prompt = f"[첨부 이미지에서 추출된 성분/텍스트 정보]\n{ocr_text}\n\n---\n\n" + prompt
@@ -223,7 +240,12 @@ A: (저장/수정된 답변)
             
         return {
             "answer": answer,
-            "sources": [{"subject": c.get('wr_subject', ''), "type": c.get('chunk_type', ''), "date": c.get('wr_datetime', '')} for c in contexts]
+            "sources": [
+                {"subject": c.get("subject", c.get("wr_subject", "")), "type": "wiki", "date": ""}
+                if source_type == "wiki"
+                else {"subject": c.get("wr_subject", ""), "type": c.get("chunk_type", ""), "date": c.get("wr_datetime", "")}
+                for c in contexts
+            ]
         }
 
     def update_knowledge_base(self, chat_type: str, question: str, answer: str):
