@@ -6,8 +6,10 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      # 벡터DB(SQLite)를 호스트에 보존.
+      # 기존 브랜드 Q&A DB와 고객용 Wiki 검색 파일을 호스트에 보존.
       - ./data:/app/data
+      # Wiki는 원본/승인 상태를 관리하는 기준본이며 읽기 전용으로 검색한다.
+      - ./wiki:/app/data/wiki:ro
       - ./naver_data:/app/naver_data
       # API 키 + DB 접속정보 보존
       - ./.env:/app/.env
